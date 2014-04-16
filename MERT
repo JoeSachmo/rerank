@@ -1,0 +1,258 @@
+#!/usr/bin/env python
+import optparse
+import sys
+import random
+from bleu import bleu_stats, bleu
+
+def find_envelope(weights, candidates, m, r, hyps):
+    lines = [] #stores all the lines
+    for i in candidates: #for each candidate sentence
+        (num, hyp, feats, stats) = hyps[r*100+i]
+        slope = 0 #slope of the line = value of feature
+        b = 0 #intersect = combined weights * features
+        for feat in feats.split(' '):
+            (k,v) = feat.split('=')
+            if k == m:
+                slope = float(v)
+            else:
+                b += weights[k] * float(v)
+        lines.append((slope,b,i))
+        #sys.stderr.write("feats:{}, m:{}, slope:{}\n".format(feats,m,slope))
+        #exit(1)
+    lines.sort() #sort the list so highest slope is first
+    line = lines.pop() # pop the first line
+    envelope = [(hyps[r*100+line[2]],line,float('-inf'),float('inf'))] #line with highest slope must be in envelope
+    while lines: #go through all lines
+        nline = lines.pop() #get next line
+        nenvelope = [] #new upper envelope
+        for (i,(hyp,l,minx,maxx)) in enumerate(envelope): #for each element in the envelope
+            if float(nline[0] - l[0]) == 0: #if the slopes are the same, it will not intersect just continue
+                nenvelope.append((hyp,l,minx,maxx))
+                continue
+            intersect = (l[1] - nline[1])/float(nline[0] - l[0]) #else find intersect point
+            if minx < intersect and intersect < maxx: #if that point is within the upper envelope range, it will be part
+                nenvelope.append((hyp,l,minx,intersect)) #of the new envelope, update the envelope
+                nenvelope.append((hyps[r*100+nline[2]],nline,intersect,float('inf'))) #put the new line in envelope
+                envelope = nenvelope[:] #copy envelope
+                break
+            else:
+                nenvelope.append((hyp,l,minx,maxx)) #else continue with envelope as is
+    return envelope 
+
+def get_error(weights, candidates, hyps, ref):
+    tot_stats = [0 for i in xrange(10)]
+    for s in xrange(0, num_sents):
+        pos_cand = candidates[s]
+        (best_score, best) = (-1e300, [])
+        for c in pos_cand:
+            #sys.stderr.write("{}\n".format(c))
+            (num, hyp, feats, stats) = hyps[s*100+c]
+            score = 0.0
+            for feat in feats.split(' '):
+                (k, v) = feat.split('=')
+                score += weights[k] * float(v)
+            if score > best_score:
+                (best_score, best) = (score, stats)
+        #pick_cand.append(hyp)
+        #sys.stderr.write("{}\n".format(best))
+        for i in xrange(len(tot_stats)):
+            tot_stats[i] += best[i]
+    return bleu(tot_stats)
+
+optparser = optparse.OptionParser()
+optparser.add_option("-k", "--kbest-list", dest="input", default="data/dev+test.100best", help="100-best translation lists")
+optparser.add_option("-r", "--reference-list", dest="ref", default="data/dev.ref", help="reference translation lists")
+optparser.add_option("-l", "--lm", dest="lm", default=-1.0, type="float", help="Language model weight")
+optparser.add_option("-t", "--tm1", dest="tm1", default=-0.5, type="float", help="Translation model p(e|f) weight")
+optparser.add_option("-s", "--tm2", dest="tm2", default=-0.5, type="float", help="Lexical translation model p_lex(f|e) weight")
+(opts, _) = optparser.parse_args()
+weights = {'p(e)'       : float(opts.lm) ,
+           'p(e|f)'     : float(opts.tm1),
+           'p_lex(f|e)' : float(opts.tm2)}
+
+test_value = 0
+all_hyps = [pair.split(' ||| ') for pair in open(opts.input)]
+all_refs = [pair for pair in open(opts.ref)]
+num_sents = len(all_refs)
+sys.stderr.write("setting bleu statistics")
+for s in xrange(0, num_sents): #iterate over all sentences
+    for c in xrange(0,100):    #100 candiates for each sentence
+        stats = bleu_stats(all_hyps[s*100+c][1].split(),all_refs[s].split()) #get stats for candidate
+        stat = [ex for ex in stats]
+
+        all_hyps[s*100+c].append(stat) #append the stats to hypothesis
+    if s%10 == 0:
+        sys.stderr.write(".")
+
+currError = float('-inf')
+candidates = [set() for pair in open(opts.ref)]
+
+while True:
+    set_length = [len(cand) for cand in candidates] #how many candidates are there?
+    for s in xrange(0, num_sents):
+        hyps_for_one_sent = all_hyps[s * 100:s * 100 + 100] #all candidates for reference
+        cand_lambda = []
+        for (sent,(num, hyp, feats, stats)) in enumerate(hyps_for_one_sent):
+            score = 0.0
+            for feat in feats.split(' '):
+                (k, v) = feat.split('=')
+                score += weights[k] * float(v) #get score for hypothesis
+            cand_lambda.append((score,sent)) #put score into list
+        cand_lambda.sort(key=lambda tup: tup[0]) #sort the list
+        for i in range(10): 
+            candidates[s].add(cand_lambda.pop()[1]) #get top 25 candidates and add them to sets
+    new_set_length = [len(cand) for cand in candidates] #get new candidate set length
+    change = False
+    for (i,s) in enumerate(set_length):
+        if s != new_set_length[i]: #if any set has changed size, continue
+            change = True
+            break
+    if change == False: #else if there's not difference in candidates, we've converged
+        break
+    
+    weight_hyp = [weights.copy()] #inialize the possible weights
+    for i in range(4): #add 4 random weights
+        rand = {'p(e)'   : random.uniform(-2,2) ,
+            'p(e|f)'     : random.uniform(-2,2),
+            'p_lex(f|e)' : random.uniform(-2,2)}
+        weight_hyp.append(rand)
+    
+    j_best = -1 #what is the best weigth? -used for solving for new weight
+    iteration_num = 0
+    for (j,test_weight) in enumerate(weight_hyp): #iterate over all weights
+        j_curr_error = get_error(test_weight,candidates,all_hyps,all_refs) #get current error for candidate set
+        
+        sys.stderr.write("{},{}\n".format(len(candidates[0]),j_curr_error))
+        
+        
+        while True:
+            m_best = -1
+            l_best = 0
+            for m in test_weight: #for each type of weight
+                interval_stats = [] #set of current intervals w/ statistics
+                interval = set() #set of intervals
+                for (r,ref) in enumerate(all_refs): #for every reference sentence
+                    envelope = find_envelope(test_weight,candidates[r],m,r,all_hyps) #get the upper envelope of the weight
+                    if interval_stats: #if we already have an interval
+                        for (hyp,line,minx,maxx) in envelope: #add divisions into the interval set
+                            if minx != float('-inf'):
+                                interval.add(minx)
+                            if maxx != float('inf'):
+                                interval.add(maxx)
+                        ninterval_stats = []
+                        e = 0 #index of current envelope
+                        i = 0 #index of current aggregate interval
+                        sort_inter = sorted(interval) #sort intervals from -inf to inf
+                        sort_inter.reverse()
+                        prev_inter = float('-inf')
+                        if not sort_inter:
+                            sys.stderr.write("inter stats:{} intervals:{}\n".format(interval_stats,interval))
+                            exit(1)
+                        inter = sort_inter.pop()
+                        env = envelope[e]
+                        inter_stat = interval_stats[i]
+                        while True:
+                            nstat = inter_stat[0][:] #copy current aggregate
+
+                            for x in range(len(nstat)):
+                                nstat[x] += env[0][3][x] #add in the current stats to the aggregate
+                            ninter = (nstat[:],prev_inter,inter) #put in new aggregate list
+                            ninterval_stats.append(ninter)
+                            
+                            change = False
+                            if inter == env[3]: #if the interval was max in envelope, get new interval
+                                e += 1
+                                env = envelope[e]
+                                change = True
+                                #sys.stderr.write("beep\n")
+                            if inter == inter_stat[2]: #if the integral was max in aggregate, get new interval
+                                i += 1
+                                inter_stat = interval_stats[i]
+                                change = True
+                            if change == False: #debug if neither happened
+                                sys.stderr.write("inter {},{},{}, {}, {}\n".format(inter,inter_stat[2],abs(inter - inter_stat[2]),interval_stats[i-1][2],interval_stats[i-2][2]))
+                                sys.stderr.write("env {},{},{}\n".format(inter,env[3],abs(inter - env[3])))
+                                exit(1)
+                            if not sort_inter: #if there are no more intervals
+                                nstat = inter_stat[0][:] #get last interval of aggregate
+                                for x in range(len(nstat)): #add in last interval of envelope
+                                    nstat[x] += env[0][3][x]
+                                ninter = (nstat[:],inter,float('inf')) #append to new aggregate
+                                ninterval_stats.append(ninter)
+                                break #get new envelope
+                            prev_inter = inter #move interval
+                            inter = sort_inter.pop()
+                        interval_stats = ninterval_stats[:] #replace interval_stats with new aggregate
+                        
+                    else: #if this is the first envelope
+                        for (hyp,line,minx,maxx) in envelope:
+                            interval_stats.append((hyp[3][:],minx,maxx)) #append to aggregate
+                            if minx != float('-inf'): #add all intervals
+                                interval.add(minx)
+                            if maxx != float('inf'):
+                                interval.add(maxx)
+                
+                (best_l, b) = (0,float('-inf')) #find best value for weight
+                
+                iterate = sorted(interval)
+                prev = iterate.pop()
+                nextp = iterate.pop()
+                testing = test_weight.copy()
+                while iterate: #for each interval
+                    testing[m] = (prev+nextp)/float(2)
+                    score = get_error(testing,candidates,all_hyps,all_refs) #get bleu score
+                    if score > b: #if the bleu score improves
+                        (best_l, b) = ((prev+nextp)/float(2),score) #put that value as new best value
+                        test_value = b
+                    prev = nextp
+                    nextp = iterate.pop()
+                    #sys.stderr.write("{}".format(len(iterate)))
+                    if len(iterate)%50 == 0:
+                        sys.stderr.write(".")
+                sys.stderr.write("\n")
+                """
+                (best_l, b) = (0,float('-inf')) #find best value for weight
+                for (stats,minx,maxx) in interval_stats: #for each interval
+                    score = bleu(stats) #get bleu score
+                    if score > b: #if the bleu score improves
+                        (best_l, b) = ((maxx+minx)/float(2),score) #put that value as new best value
+                        test_value = b
+                """
+                        
+                
+                if b > j_curr_error:  #if b beats the old error
+                    sys.stderr.write("new error:{} old:{}\n".format(b,j_curr_error))
+                    m_best = m #set m as the best
+                    l_best = best_l #set new best value
+                    j_curr_error = b #set new error value
+            if m_best != -1: #if we've found a better error rate
+                test_weight[m_best] = l_best #place the value in the weight
+                sys.stderr.write("supposedly:{} actually:{}".format(test_value,get_error(test_weight,candidates,all_hyps,all_refs)))
+            else:
+                break
+            
+        if j_curr_error > currError: #if the best value for that j is better than best error
+            currError = j_curr_error #update best blue
+            j_best = j #update best j
+            weights = test_weight.copy() #set new default weight
+            sys.stderr.write("{}\n".format(test_weight))
+            sys.stderr.write("changed to {}\n".format(currError))
+    sys.stderr.write("{}\n".format(weights))
+    if j_best == -1: #if bleu doesn't change, convergence
+        break
+
+for s in xrange(0, num_sents):
+  hyps_for_one_sent = all_hyps[s * 100:s * 100 + 100]
+  (best_score, best) = (-1e300, '')
+  for (num, hyp, feats, stats) in hyps_for_one_sent:
+    score = 0.0
+    for feat in feats.split(' '):
+      (k, v) = feat.split('=')
+      score += weights[k] * float(v)
+    if score > best_score:
+      (best_score, best) = (score, hyp)
+  try: 
+    sys.stdout.write("%s\n" % best)
+  except (Exception):
+    sys.exit(1)
+
